@@ -10,6 +10,24 @@ import datetime
 import math
 from typing import Dict, List, Any, Callable
 from dataclasses import dataclass
+import re
+import aiohttp
+import asyncio
+
+urls = [""]
+
+async def fetch(session, url):
+    async with session.get(url) as response:
+        # you can also use await response.json() if API returns JSON
+        data = await response.text()
+        return url, response.status, len(data)
+    
+
+default_prompt_instruction = """Respond in plain text, not JSON.
+If a function call response then only respond by formulating the output of the function call.
+The response should be brief and to the point, it should be a single line.
+Do not give suggestions unless specifically asked.
+If the URL's are present in the function result, include them in the response."""
 
 
 @dataclass
@@ -89,17 +107,19 @@ class Qwen3Client:
             
             return "Unknown analysis type"
         
-         # Function to get HTTP status code from a URL
-        def get_latest_chapter_status(manga: str) -> str:
-            """For the given manga, compute the URL, make the API call and based on the HTTP status code respond if the latest chapter is available."""
+        async def get_latest_chapter_urls() -> str:
+            """For a set of manga, compute the URL, make the API call and based on the HTTP status code respond with the URL if the latest chapter is available."""
             try:
-                url = ""
-                if( manga.lower() == "solo leveling"):
-                    url = "https://asuracomic.net/series/solo-leveling-ragnarok-1f84f5a6/chapter/56"
-                response = requests.get(url)
-                return f"HTTP status code for {url}: {response.status_code}"
+                new_chapter_urls_for_manga = []
+                async with aiohttp.ClientSession() as session:
+                    tasks = [fetch(session, url) for url in urls]
+                    results = await asyncio.gather(*tasks)
+                    for url, status, size in results:
+                        if status == 200:
+                            new_chapter_urls_for_manga.append(url)
+                return f"New chapters available at: {', '.join(new_chapter_urls_for_manga)}" if new_chapter_urls_for_manga else "No new chapters available."
             except Exception as e:
-                return f"Error fetching {url}: {str(e)}"
+                return f"Error fetching chapters: {str(e)}"
         
         # Register functions
         self.register_function(
@@ -175,19 +195,14 @@ class Qwen3Client:
         )
 
         self.register_function(
-            "get_latest_chapter_status",
-            "Get the status of the latest chapter for a given manga",
+            "get_latest_chapter_urls",
+            "Get the URL of latest chapter of manga's",
             {
                 "type": "object",
-                "properties": {
-                    "manga": {
-                        "type": "string",
-                        "description": "The name of the manga to fetch"
-                    }
-                },
-                "required": ["manga"]
+                "properties": {},
+                "required": []
             },
-            get_latest_chapter_status
+            get_latest_chapter_urls
         )
     
     def register_function(self, name: str, description: str, parameters: Dict[str, Any], function: Callable):
@@ -217,7 +232,12 @@ class Qwen3Client:
         
         try:
             func_def = self.available_functions[function_name]
-            result = func_def.function(**arguments)
+            func = func_def.function
+            import inspect
+            if inspect.iscoroutinefunction(func):
+                result = asyncio.run(func(**arguments))
+            else:
+                result = func(**arguments)
             return str(result)
         except Exception as e:
             return f"Error executing {function_name}: {str(e)}"
@@ -241,9 +261,9 @@ Available functions:
 {json.dumps(function_specs, indent=2)}
 
 If you don't need to call a function, respond normally in plain text.
-If a function call response then only respond by formulating the output of the function call.
-The response should be brief and to the point, it should be a single line.
-Do not give suggestions unless specifically asked."""
+
+{default_prompt_instruction}
+"""
             
             # First request to get initial response
             payload = {
@@ -274,6 +294,8 @@ Do not give suggestions unless specifically asked."""
             response_data = response.json()
             assistant_message = response_data.get("message", {}).get("content", "")
             
+            # print(f"[DEBUG] Assistant message: {assistant_message}")
+            
             # Check if the response contains a function call
             function_call_result = self._parse_function_call(assistant_message)
             
@@ -281,22 +303,20 @@ Do not give suggestions unless specifically asked."""
                 function_name = function_call_result.get("name")
                 function_args = function_call_result.get("arguments", {})
                 
-                # Execute the function
                 execution_result = self.execute_function(function_name, function_args)
-                
+                # print(f"[DEBUG] Function '{function_name}' executed with result: {execution_result}")
+
                 # Get final response with function result
                 follow_up_payload = {
                     "model": self.model_name,
                     "messages": [
                         {
                             "role": "system",
-                            "content": """You are Qwen 3.
+                            "content": f"""You are Qwen 3.
                             The user asked a question and you called a function.
                             Use the function result to provide a helpful response to the user.
-                            Respond in plain text, not JSON.
-                            If a function call response then only respond by formulating the output of the function call.
-                            The response should be brief and to the point, it should be a single line.
-                            Do not give suggestions unless specifically asked.
+                            
+                            {default_prompt_instruction}
                             """
                         },
                         {
@@ -309,7 +329,10 @@ Do not give suggestions unless specifically asked."""
                         },
                         {
                             "role": "user",
-                            "content": f"Function result: {execution_result}. Please provide a helpful response based on this result."
+                            "content": f"""Function result: {execution_result}. Please provide a helpful response based on this result.
+                            
+                            {default_prompt_instruction}
+                            """
                         }
                     ],
                     "stream": False
@@ -347,13 +370,15 @@ Do not give suggestions unless specifically asked."""
         """Parse function call from model response"""
         try:
             # Try to parse as JSON
+            response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
             parsed = json.loads(response.strip())
+            # print(f"[DEBUG] Parsed JSON: {parsed}")
             if "function_call" in parsed:
                 return parsed["function_call"]
         except json.JSONDecodeError:
             # Try to extract JSON from text response
-            import re
             json_match = re.search(r'\{[^{}]*"function_call"[^{}]*\{[^{}]*\}[^{}]*\}', response)
+            # print(f"[DEBUG] JSON match: {json_match.group() if json_match else 'None'}")
             if json_match:
                 try:
                     parsed = json.loads(json_match.group())
@@ -403,8 +428,8 @@ def main():
                 continue
             
             print("Qwen: ", end="", flush=True)
-            response = client.chat_with_functions(user_input)
-            print(response)
+            response = re.sub(r'<think>.*?</think>', '', client.chat_with_functions(user_input), flags=re.DOTALL)
+            print(response.strip())
             print()
             
         except KeyboardInterrupt:
