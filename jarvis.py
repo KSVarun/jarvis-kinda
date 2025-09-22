@@ -14,7 +14,6 @@ from dataclasses import dataclass
 
 @dataclass
 class FunctionDefinition:
-    """Define a function that can be called by Llama 4 Scout"""
     name: str
     description: str
     parameters: Dict[str, Any]
