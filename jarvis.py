@@ -20,7 +20,7 @@ import re
 import aiohttp
 import asyncio
 
-model_name = "qwen3:1   4b"
+model_name = "qwen3:4b"
 
 async def fetch(session, url):
     start_ts = time.perf_counter()
@@ -57,6 +57,9 @@ class Qwen3Client:
         self.base_url = base_url
         self.model_name = model_name
         self.available_functions = {}
+        # Rolling conversation history of alternating user/assistant turns
+        # Format: [{"role": "user"|"assistant", "content": str}, ...]
+        self.history: List[Dict[str, str]] = []
         self.setup_default_functions()
     
     def setup_default_functions(self):
@@ -299,21 +302,18 @@ If you don't need to call a function, respond normally in plain text.
 {default_prompt_instruction}
 """
             # First request to get initial response
+            assembled_messages: List[Dict[str, str]] = (
+                [{"role": "system", "content": system_prompt}] +
+                self.history +
+                [{"role": "user", "content": message}]
+            )
             payload = {
                 "model": self.model_name,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": message
-                    }
-                ],
-                "stream": False,
-                "format": "json" if self._needs_function_call(message) else ""
+                "messages": assembled_messages,
+                "stream": False
             }
+            if self._needs_function_call(message):
+                payload["format"] = "json"
             
             http_start = time.perf_counter()
             response = requests.post(
@@ -325,6 +325,11 @@ If you don't need to call a function, respond normally in plain text.
             logging.debug(f"[timing] chat:first_request duration_ms={http_duration_ms:.2f}")
             
             if response.status_code != 200:
+                try:
+                    err_text = response.text
+                except Exception:
+                    err_text = "<no body>"
+                logging.error(f"[api] chat error status={response.status_code} body={err_text}")
                 return f"Error: Failed to get response from model (status {response.status_code})"
             
             response_data = response.json()
@@ -358,10 +363,8 @@ If you don't need to call a function, respond normally in plain text.
                             {default_prompt_instruction}
                             """
                         },
-                        {
-                            "role": "user",
-                            "content": message
-                        },
+                        *self.history,
+                        {"role": "user", "content": message},
                         {
                             "role": "assistant",
                             "content": f"I'll use the {function_name} function to help answer your question."
@@ -390,7 +393,14 @@ If you don't need to call a function, respond normally in plain text.
                     final_response = follow_up_response.json()
                     total_duration_ms = (time.perf_counter() - total_start) * 1000
                     logging.debug(f"[timing] chat_with_functions:end with_function duration_ms={total_duration_ms:.2f}")
-                    return final_response.get("message", {}).get("content", "No response")
+                    final_text = final_response.get("message", {}).get("content", "No response")
+                    # Update history with this turn (user + assistant)
+                    self.history.append({"role": "user", "content": message})
+                    self.history.append({"role": "assistant", "content": final_text})
+                    # Trim history to last 10 messages to control context growth
+                    if len(self.history) > 10:
+                        self.history = self.history[-10:]
+                    return final_text
                 else:
                     total_duration_ms = (time.perf_counter() - total_start) * 1000
                     logging.debug(f"[timing] chat_with_functions:end followup_failed duration_ms={total_duration_ms:.2f}")
@@ -398,6 +408,11 @@ If you don't need to call a function, respond normally in plain text.
             
             total_duration_ms = (time.perf_counter() - total_start) * 1000
             logging.debug(f"[timing] chat_with_functions:end no_function duration_ms={total_duration_ms:.2f}")
+            # Update history when no function is called
+            self.history.append({"role": "user", "content": message})
+            self.history.append({"role": "assistant", "content": assistant_message})
+            if len(self.history) > 10:
+                self.history = self.history[-10:]
             return assistant_message
             
         except requests.exceptions.RequestException as e:
