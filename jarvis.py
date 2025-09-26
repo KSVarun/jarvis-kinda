@@ -20,7 +20,7 @@ import re
 import aiohttp
 import asyncio
 
-model_name = "qwen3:4b"
+model_name = "qwen3:14b"
 
 async def fetch(session, url):
     start_ts = time.perf_counter()
@@ -151,6 +151,33 @@ class Qwen3Client:
                 return f"New chapters available at: {', '.join(new_chapter_urls_for_manga)}" if new_chapter_urls_for_manga else "No new chapters available."
             except Exception as e:
                 return f"Error fetching chapters: {str(e)}"
+
+        # DB query tools
+        def get_latest_read_chapter(comic_name: str) -> str:
+            """Return the latest read chapter number for the given comic name."""
+            if SessionLocal is None:
+                return "DB not initialized"
+            try:
+                with SessionLocal() as session:
+                    row = get_comic_by_name(session, comic_name)
+                    if not row or not row.read_chapters:
+                        return "No chapters read"
+                    last_ch = row.read_chapters[-1]
+                    return str(last_ch)
+            except Exception as e:
+                return f"Error at get_latest_read_chapter: {str(e)}"
+
+        def get_read_chapter_count(comic_name: str) -> str:
+            """Return the count of read chapters for the given comic name."""
+            if SessionLocal is None:
+                return "DB not initialized"
+            try:
+                with SessionLocal() as session:
+                    row = get_comic_by_name(session, comic_name)
+                    count = len(row.read_chapters) if row and row.read_chapters else 0
+                    return str(count)
+            except Exception as e:
+                return f"Error at get_read_chapter_count: {str(e)}"
         
         # Register functions
         self.register_function(
@@ -235,6 +262,74 @@ class Qwen3Client:
             },
             get_latest_chapter_urls
         )
+
+        self.register_function(
+            "get_latest_read_chapter",
+            "Get the latest read chapter number for a comic",
+            {
+                "type": "object",
+                "properties": {
+                    "comic_name": {"type": "string", "description": "Comic name"}
+                },
+                "required": ["comic_name"]
+            },
+            get_latest_read_chapter
+        )
+
+        self.register_function(
+            "get_read_chapter_count",
+            "Get how many chapters have been read for a comic",
+            {
+                "type": "object",
+                "properties": {
+                    "comic_name": {"type": "string", "description": "Comic name"}
+                },
+                "required": ["comic_name"]
+            },
+            get_read_chapter_count
+        )
+
+        # Generic DB execute tool
+        def db_execute_tool(op: str, table: str, filters: Dict[str, Any] | None = None, values: Dict[str, Any] | None = None, order_by: str | None = None, limit: int | None = None) -> str:
+            return db_execute(op=op, table=table, filters=filters, values=values, order_by=order_by, limit=limit)
+
+        self.register_function(
+            "db_execute",
+            "Generic DB operation for select/insert/update/delete on comics_read. Columns: name (String, PK), read_chapters (String[]), source_base_url (String, NOT NULL)",
+            {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["select", "insert", "update", "delete"]},
+                    "table": {"type": "string", "enum": ["comics_read"]},
+                    "filters": {"type": "object"},
+                    "values": {"type": "object"},
+                    "order_by": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["op", "table"]
+            },
+            db_execute_tool
+        )
+
+        # Schema discovery tool
+        def db_get_schema(table: str) -> str:
+            model = MODEL_REGISTRY.get(table)
+            if not model:
+                return f"Unknown table: {table}"
+            return json.dumps(get_model_columns(model))
+
+        self.register_function(
+            "db_get_schema",
+            "Get table column info (name, type, nullable, primary_key)",
+            {
+                "type": "object",
+                "properties": {
+                    "table": {"type": "string", "enum": ["comics_read"]}
+                },
+                "required": ["table"]
+            },
+            db_get_schema
+        )
     
     def register_function(self, name: str, description: str, parameters: Dict[str, Any], function: Callable):
         """Register a function for use with the model"""
@@ -315,6 +410,7 @@ If you don't need to call a function, respond normally in plain text.
             if self._needs_function_call(message):
                 payload["format"] = "json"
             
+            logging.debug(f"[DEBUG] Payload: {payload}")
             http_start = time.perf_counter()
             response = requests.post(
                 f"{self.base_url}/api/chat",
@@ -333,9 +429,10 @@ If you don't need to call a function, respond normally in plain text.
                 return f"Error: Failed to get response from model (status {response.status_code})"
             
             response_data = response.json()
+            logging.debug(f"[DEBUG] Response data: {response_data}")
             assistant_message = response_data.get("message", {}).get("content", "")
             
-            # print(f"[DEBUG] Assistant message: {assistant_message}")
+            logging.debug(f"[DEBUG] Assistant message: {assistant_message}")
             
             # Check if the response contains a function call
             function_call_result = self._parse_function_call(assistant_message)
@@ -348,7 +445,7 @@ If you don't need to call a function, respond normally in plain text.
                 execution_result = self.execute_function(function_name, function_args)
                 exec_result_ms = (time.perf_counter() - exec_result_start) * 1000
                 logging.debug(f"[timing] chat:function_execution duration_ms={exec_result_ms:.2f}")
-                # print(f"[DEBUG] Function '{function_name}' executed with result: {execution_result}")
+                logging.debug(f"[DEBUG] Function '{function_name}' executed with result: {execution_result}")
 
                 # Get final response with function result
                 follow_up_payload = {
@@ -499,6 +596,116 @@ def get_next_chapter_urls_from_db() -> List[str]:
 
     logging.debug(f"[db] Computed next-chapter URLs: {urls_out}")
     return urls_out
+
+
+def get_comic_by_name(session, name: str) -> ComicsRead | None:
+    return (
+        session
+        .query(ComicsRead)
+        .filter(ComicsRead.name.ilike(f"%{name}%"))
+        .first()
+    )
+
+
+# Simple model registry for generic DB ops
+MODEL_REGISTRY: Dict[str, Any] = {
+    "comics_read": ComicsRead,
+}
+
+
+def _serialize_row(row: Any) -> Dict[str, Any]:
+    if isinstance(row, ComicsRead):
+        return {
+            "name": row.name,
+            "read_chapters": row.read_chapters,
+            "source_base_url": row.source_base_url,
+        }
+    # Fallback: reflect __dict__ without private attrs
+    return {k: v for k, v in vars(row).items() if not k.startswith("_")}
+
+
+def get_model_columns(model: Any) -> List[Dict[str, Any]]:
+    """Return model columns with basic metadata for LLM consumption."""
+    cols: List[Dict[str, Any]] = []
+    for col in model.__table__.columns:
+        cols.append({
+            "name": col.name,
+            "type": str(col.type),
+            "nullable": bool(col.nullable),
+            "primary_key": bool(col.primary_key),
+        })
+    return cols
+
+
+def db_execute(op: str, table: str, filters: Dict[str, Any] | None = None, values: Dict[str, Any] | None = None, order_by: str | None = None, limit: int | None = None) -> str:
+    """Generic DB operation for basic CRUD on registered models.
+
+    - op: one of "select", "insert", "update", "delete"
+    - table: model key from MODEL_REGISTRY, e.g. "comics_read"
+    - filters: equality filters {column: value}
+    - values: data for insert/update
+    - order_by: column name to order by (ascending)
+    - limit: optional integer limit for select
+    Returns a brief string or a JSON string for selects.
+    """
+    if SessionLocal is None:
+        return "DB not initialized"
+    model = MODEL_REGISTRY.get(table)
+    if model is None:
+        return f"Unknown table: {table}"
+    try:
+        with SessionLocal() as session:
+            if op == "select":
+                query = session.query(model)
+                if filters:
+                    for col, val in filters.items():
+                        if hasattr(model, col):
+                            query = query.filter(getattr(model, col) == val)
+                if order_by and hasattr(model, order_by):
+                    query = query.order_by(getattr(model, order_by).asc())
+                if limit:
+                    query = query.limit(int(limit))
+                rows = [_serialize_row(r) for r in query.all()]
+                return json.dumps(rows)
+
+            if op == "insert":
+                if not values:
+                    return "Missing values"
+                instance = model(**values)
+                session.add(instance)
+                session.commit()
+                return "Inserted"
+
+            if op == "update":
+                if not filters:
+                    return "Missing filters"
+                if not values:
+                    return "Missing values"
+                query = session.query(model)
+                for col, val in filters.items():
+                    if hasattr(model, col):
+                        query = query.filter(getattr(model, col) == val)
+                count = query.update(values, synchronize_session=False)
+                session.commit()
+                return f"Updated {count}"
+
+            if op == "delete":
+                if not filters:
+                    return "Missing filters"
+                query = session.query(model)
+                for col, val in filters.items():
+                    if hasattr(model, col):
+                        query = query.filter(getattr(model, col) == val)
+                count = 0
+                for obj in query.all():
+                    session.delete(obj)
+                    count += 1
+                session.commit()
+                return f"Deleted {count}"
+
+            return f"Unsupported op: {op}"
+    except Exception as e:
+        return f"Error at db_execute: {str(e)}"
 
 
 SessionLocal = None
