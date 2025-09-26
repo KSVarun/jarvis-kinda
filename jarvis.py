@@ -8,18 +8,30 @@ import json
 import requests
 import datetime
 import math
+import time
+import logging
+import os
+from sqlalchemy import create_engine, Column, String
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+from sqlalchemy.orm import declarative_base, sessionmaker
 from typing import Dict, List, Any, Callable
 from dataclasses import dataclass
 import re
 import aiohttp
 import asyncio
 
-urls = [""]
+model_name = "qwen3:1   4b"
 
 async def fetch(session, url):
+    start_ts = time.perf_counter()
+    logging.debug(f"[timing] fetch:start url={url}")
     async with session.get(url) as response:
         # you can also use await response.json() if API returns JSON
         data = await response.text()
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        logging.debug(
+            f"[timing] fetch:end url={url} status={response.status} bytes={len(data)} duration_ms={duration_ms:.2f}"
+        )
         return url, response.status, len(data)
     
 
@@ -41,7 +53,7 @@ class FunctionDefinition:
 class Qwen3Client:
     """Client for interacting with Qwen3 4B model with function calling"""
     
-    def __init__(self, base_url: str = "http://localhost:11434", model_name: str = "qwen3:4b"):
+    def __init__(self, base_url: str = "http://localhost:11434", model_name: str = model_name):
         self.base_url = base_url
         self.model_name = model_name
         self.available_functions = {}
@@ -110,13 +122,29 @@ class Qwen3Client:
         async def get_latest_chapter_urls() -> str:
             """For a set of manga, compute the URL, make the API call and based on the HTTP status code respond with the URL if the latest chapter is available."""
             try:
+                start_overall = time.perf_counter()
+                logging.debug("[timing] get_latest_chapter_urls:start")
+                # Build URLs from DB; fallback to empty list if no DB or rows
+                try:
+                    computed_urls = get_next_chapter_urls_from_db()
+                except Exception as url_e:
+                    logging.error(f"[db] Failed to compute next chapter URLs: {url_e}")
+                    computed_urls = []
+                    return "Error: Failed to compute next chapter URLs"
+
                 new_chapter_urls_for_manga = []
                 async with aiohttp.ClientSession() as session:
-                    tasks = [fetch(session, url) for url in urls]
+                    targets = computed_urls
+                    tasks = [fetch(session, url) for url in targets]
+                    gather_start = time.perf_counter()
                     results = await asyncio.gather(*tasks)
+                    gather_ms = (time.perf_counter() - gather_start) * 1000
+                    logging.debug(f"[timing] get_latest_chapter_urls:gather duration_ms={gather_ms:.2f}")
                     for url, status, size in results:
                         if status == 200:
                             new_chapter_urls_for_manga.append(url)
+                overall_ms = (time.perf_counter() - start_overall) * 1000
+                logging.debug(f"[timing] get_latest_chapter_urls:end duration_ms={overall_ms:.2f}")
                 return f"New chapters available at: {', '.join(new_chapter_urls_for_manga)}" if new_chapter_urls_for_manga else "No new chapters available."
             except Exception as e:
                 return f"Error fetching chapters: {str(e)}"
@@ -231,6 +259,8 @@ class Qwen3Client:
             return f"Error: Function '{function_name}' not found"
         
         try:
+            exec_start = time.perf_counter()
+            logging.debug(f"[timing] execute_function:start name={function_name} args={arguments}")
             func_def = self.available_functions[function_name]
             func = func_def.function
             import inspect
@@ -238,6 +268,8 @@ class Qwen3Client:
                 result = asyncio.run(func(**arguments))
             else:
                 result = func(**arguments)
+            exec_duration_ms = (time.perf_counter() - exec_start) * 1000
+            logging.debug(f"[timing] execute_function:end name={function_name} duration_ms={exec_duration_ms:.2f}")
             return str(result)
         except Exception as e:
             return f"Error executing {function_name}: {str(e)}"
@@ -245,6 +277,8 @@ class Qwen3Client:
     def chat_with_functions(self, message: str) -> str:
         """Send a message to Qwen 3 4B with function calling enabled"""
         try:
+            total_start = time.perf_counter()
+            logging.debug("[timing] chat_with_functions:start")
             # Prepare the system prompt with function definitions
             function_specs = self.get_function_definitions()
             system_prompt = f"""You are Qwen 3, a helpful AI assistant with access to tools. 
@@ -264,7 +298,6 @@ If you don't need to call a function, respond normally in plain text.
 
 {default_prompt_instruction}
 """
-            
             # First request to get initial response
             payload = {
                 "model": self.model_name,
@@ -282,11 +315,14 @@ If you don't need to call a function, respond normally in plain text.
                 "format": "json" if self._needs_function_call(message) else ""
             }
             
+            http_start = time.perf_counter()
             response = requests.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
                 headers={"Content-Type": "application/json"}
             )
+            http_duration_ms = (time.perf_counter() - http_start) * 1000
+            logging.debug(f"[timing] chat:first_request duration_ms={http_duration_ms:.2f}")
             
             if response.status_code != 200:
                 return f"Error: Failed to get response from model (status {response.status_code})"
@@ -303,7 +339,10 @@ If you don't need to call a function, respond normally in plain text.
                 function_name = function_call_result.get("name")
                 function_args = function_call_result.get("arguments", {})
                 
+                exec_result_start = time.perf_counter()
                 execution_result = self.execute_function(function_name, function_args)
+                exec_result_ms = (time.perf_counter() - exec_result_start) * 1000
+                logging.debug(f"[timing] chat:function_execution duration_ms={exec_result_ms:.2f}")
                 # print(f"[DEBUG] Function '{function_name}' executed with result: {execution_result}")
 
                 # Get final response with function result
@@ -338,18 +377,27 @@ If you don't need to call a function, respond normally in plain text.
                     "stream": False
                 }
                 
+                follow_http_start = time.perf_counter()
                 follow_up_response = requests.post(
                     f"{self.base_url}/api/chat",
                     json=follow_up_payload,
                     headers={"Content-Type": "application/json"}
                 )
+                follow_http_duration_ms = (time.perf_counter() - follow_http_start) * 1000
+                logging.debug(f"[timing] chat:followup_request duration_ms={follow_http_duration_ms:.2f}")
                 
                 if follow_up_response.status_code == 200:
                     final_response = follow_up_response.json()
+                    total_duration_ms = (time.perf_counter() - total_start) * 1000
+                    logging.debug(f"[timing] chat_with_functions:end with_function duration_ms={total_duration_ms:.2f}")
                     return final_response.get("message", {}).get("content", "No response")
                 else:
+                    total_duration_ms = (time.perf_counter() - total_start) * 1000
+                    logging.debug(f"[timing] chat_with_functions:end followup_failed duration_ms={total_duration_ms:.2f}")
                     return f"Function executed: {execution_result}"
             
+            total_duration_ms = (time.perf_counter() - total_start) * 1000
+            logging.debug(f"[timing] chat_with_functions:end no_function duration_ms={total_duration_ms:.2f}")
             return assistant_message
             
         except requests.exceptions.RequestException as e:
@@ -389,8 +437,89 @@ If you don't need to call a function, respond normally in plain text.
         return None
 
 
+Base = declarative_base()
+
+
+class ComicsRead(Base):
+    __tablename__ = "comics_read"
+    # Use name as primary key since a comic name should be unique
+    name = Column(String, primary_key=True)
+    read_chapters = Column(PG_ARRAY(String), nullable=False)
+    source_base_url = Column(String, nullable=False)
+
+
+def get_engine():
+    """Create a SQLAlchemy engine from DATABASE_URL env var.
+    Example: postgresql+psycopg://user:password@localhost:5432/mydb
+    """
+    database_url = f"postgresql+psycopg://{os.getenv('POSTGRES_USER_NAME')}:{os.getenv('POSTGRES_PASSWORD_VALUE')}@localhost:5432/{os.getenv('POSTGRES_DB_NAME')}"
+    return create_engine(database_url, pool_pre_ping=True)
+
+
+def get_next_chapter_urls_from_db() -> List[str]:
+    """Read comics and compute next-chapter URLs.
+
+    For each row, find the highest chapter number in read_chapters,
+    increment by 1, and join with source_base_url.
+    Accepts chapter numbers like "55" or "chapter/55" and extracts the
+    trailing integer.
+    """
+    if SessionLocal is None:
+        raise RuntimeError("SessionLocal not initialized. Call init_db() first.")
+
+    urls_out: List[str] = []
+    with SessionLocal() as session:
+        rows = session.query(ComicsRead).all()
+        for row in rows:
+            # If there are recorded chapters and the list is ordered, use the last one
+            if row.read_chapters and len(row.read_chapters) > 0:
+                last_chapter = row.read_chapters[-1]
+                next_chapter = int(last_chapter) + 1 if int(last_chapter) >= 0 else 1
+            else:
+                # If none recorded, start from chapter 1
+                next_chapter = 1
+
+            base = row.source_base_url
+            urls_out.append(f"{base}{next_chapter}")
+
+    logging.debug(f"[db] Computed next-chapter URLs: {urls_out}")
+    return urls_out
+
+
+SessionLocal = None
+
+
+def init_db():
+    """Initialize the database schema (create tables if they don't exist)."""
+    engine = get_engine()
+    if engine is None:
+        return False
+    global SessionLocal
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    start_ts = time.perf_counter()
+    logging.debug("[db] Creating tables if not exist...")
+    Base.metadata.create_all(bind=engine)
+    duration_ms = (time.perf_counter() - start_ts) * 1000
+    logging.debug(f"[timing] db:init duration_ms={duration_ms:.2f}")
+    return True
+
+
 def main():
     """Main function to demonstrate Qwen3 4B function calling"""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logging.debug("[startup] Program started")
+    # Initialize database schema (no-op if DATABASE_URL not set)
+    try:
+        if init_db():
+            logging.info("[db] Initialized schema")
+        else:
+            logging.info("[db] Schema initialization skipped")
+    except Exception as db_e:
+        logging.error(f"[db] Initialization failed: {db_e}")
     print("🚀 Qwen3 4B Function Calling Demo")
     print("=" * 50)
     
@@ -428,7 +557,10 @@ def main():
                 continue
             
             print("Qwen: ", end="", flush=True)
+            req_start = time.perf_counter()
             response = re.sub(r'<think>.*?</think>', '', client.chat_with_functions(user_input), flags=re.DOTALL)
+            req_ms = (time.perf_counter() - req_start) * 1000
+            logging.debug(f"[timing] main:request_total duration_ms={req_ms:.2f}")
             print(response.strip())
             print()
             
