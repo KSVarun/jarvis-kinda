@@ -77,7 +77,7 @@ class Qwen3Client:
                 result = eval(expression)
                 return f"Result: {result}"
             except Exception as e:
-                return f"Error: {str(e)}"
+                return f"Error at calculate: {str(e)}"
         
         # Get current time function
         def get_current_time(timezone: str = "UTC") -> str:
@@ -418,7 +418,7 @@ If you don't need to call a function, respond normally in plain text.
         except requests.exceptions.RequestException as e:
             return f"Error connecting to Ollama: {str(e)}"
         except Exception as e:
-            return f"Error: {str(e)}"
+            return f"Error in chat_with_functions: {str(e)}"
     
     def _needs_function_call(self, message: str) -> bool:
         """Determine if a message likely needs a function call"""
@@ -583,7 +583,7 @@ def main():
             print("\nGoodbye!")
             break
         except Exception as e:
-            print(f"Error: {str(e)}")
+            print(f"Error at main: {str(e)}")
 
 
 if __name__ == "__main__":
