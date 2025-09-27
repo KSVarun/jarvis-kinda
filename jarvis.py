@@ -681,13 +681,44 @@ def db_execute(op: str, table: str, filters: Dict[str, Any] | None = None, value
                     return "Missing filters"
                 if not values:
                     return "Missing values"
-                query = session.query(model)
-                for col, val in filters.items():
-                    if hasattr(model, col):
-                        query = query.filter(getattr(model, col) == val)
-                count = query.update(values, synchronize_session=False)
-                session.commit()
-                return f"Updated {count}"
+                
+                # Special handling for read_chapters updates
+                if table == "comics_read" and "read_chapters" in values:
+                    # Get existing records first
+                    query = session.query(model)
+                    for col, val in filters.items():
+                        if hasattr(model, col):
+                            query = query.filter(getattr(model, col) == val)
+                    existing_records = query.all()
+                    
+                    if not existing_records:
+                        return "No records found matching filters"
+                    
+                    # For each record, merge read_chapters
+                    for record in existing_records:
+                        existing_chapters = record.read_chapters or []
+                        new_chapters = values["read_chapters"]
+                        
+                        # Merge and deduplicate while preserving order
+                        merged_chapters = list(existing_chapters)
+                        for chapter in new_chapters:
+                            if chapter not in merged_chapters:
+                                merged_chapters.append(chapter)
+                        
+                        # Update the record with merged chapters
+                        record.read_chapters = merged_chapters
+                    
+                    session.commit()
+                    return f"Updated {len(existing_records)} records with merged chapters"
+                else:
+                    # Standard update for other fields
+                    query = session.query(model)
+                    for col, val in filters.items():
+                        if hasattr(model, col):
+                            query = query.filter(getattr(model, col) == val)
+                    count = query.update(values, synchronize_session=False)
+                    session.commit()
+                    return f"Updated {count}"
 
             if op == "delete":
                 if not filters:
