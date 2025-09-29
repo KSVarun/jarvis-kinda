@@ -20,7 +20,7 @@ import re
 import aiohttp
 import asyncio
 
-model_name = "qwen3:14b"
+model_name = "gpt-oss:20b"
 
 async def fetch(session, url):
     start_ts = time.perf_counter()
@@ -367,9 +367,11 @@ class Qwen3Client:
             else:
                 result = func(**arguments)
             exec_duration_ms = (time.perf_counter() - exec_start) * 1000
+            logging.debug(f"[DEBUG] Result: {result}")
             logging.debug(f"[timing] execute_function:end name={function_name} duration_ms={exec_duration_ms:.2f}")
             return str(result)
         except Exception as e:
+            logging.error(f"[tools] Error executing {function_name}: {str(e)}")
             return f"Error executing {function_name}: {str(e)}"
     
     def chat_with_functions(self, message: str) -> str:
@@ -407,9 +409,12 @@ If you don't need to call a function, respond normally in plain text.
                 "messages": assembled_messages,
                 "stream": False
             }
-            if self._needs_function_call(message):
-                payload["format"] = "json"
+            # Avoid forcing JSON output format for OSS models like gpt-oss:20b, which may return empty content
+            # If needed, the model can still output a JSON function_call per instructions without strict formatting
             
+            # if self._needs_function_call(message):
+            #     payload["format"] = "json"
+
             logging.debug(f"[DEBUG] Payload: {payload}")
             http_start = time.perf_counter()
             response = requests.post(
@@ -430,9 +435,138 @@ If you don't need to call a function, respond normally in plain text.
             
             response_data = response.json()
             logging.debug(f"[DEBUG] Response data: {response_data}")
-            assistant_message = response_data.get("message", {}).get("content", "")
+            message_obj = response_data.get("message", {})
+            assistant_message = message_obj.get("content", "")
             
             logging.debug(f"[DEBUG] Assistant message: {assistant_message}")
+
+            # Handle OSS-style tool_calls directly (e.g., gpt-oss:20b)
+            tool_calls = message_obj.get("tool_calls") or []
+            if tool_calls:
+                try:
+                    first_call = tool_calls[0] if isinstance(tool_calls, list) else tool_calls
+                    fn = (first_call or {}).get("function", {})
+                    function_name = fn.get("name")
+                    function_args = fn.get("arguments", {})
+                    # Normalize arguments which can be a JSON string or nested {"function_call": {...}}
+                    if isinstance(function_args, str):
+                        try:
+                            function_args = json.loads(function_args)
+                        except Exception:
+                            # best effort: keep as string in a single arg if our function expects it
+                            pass
+                    if isinstance(function_args, dict) and "function_call" in function_args:
+                        inner_fc = function_args.get("function_call") or {}
+                        if isinstance(inner_fc, str):
+                            try:
+                                inner_fc = json.loads(inner_fc)
+                            except Exception:
+                                inner_fc = {}
+                        if isinstance(inner_fc, dict):
+                            # Prefer inner function call details
+                            function_name = inner_fc.get("name", function_name)
+                            function_args = inner_fc.get("arguments", {})
+                            if isinstance(function_args, str):
+                                try:
+                                    function_args = json.loads(function_args)
+                                except Exception:
+                                    pass
+                    # Handle shape: {"arguments": {...}, "name": "..."}
+                    if isinstance(function_args, dict) and "arguments" in function_args and "name" in function_args:
+                        maybe_inner_args = function_args.get("arguments")
+                        if isinstance(maybe_inner_args, str):
+                            try:
+                                maybe_inner_args = json.loads(maybe_inner_args)
+                            except Exception:
+                                pass
+                        function_name = function_args.get("name", function_name)
+                        function_args = maybe_inner_args if isinstance(maybe_inner_args, dict) else {}
+                    exec_result_start = time.perf_counter()
+                    execution_result = self.execute_function(function_name, function_args if isinstance(function_args, dict) else {"input": function_args})
+                    exec_result_ms = (time.perf_counter() - exec_result_start) * 1000
+                    logging.debug(f"[timing] chat:function_execution duration_ms={exec_result_ms:.2f}")
+
+                    # Follow-up response with function result
+                    follow_up_payload = {
+                        "model": self.model_name,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": f"""You are Qwen 3.
+                                The user asked a question and you called a function.
+                                Use the function result to provide a helpful response to the user.
+                                
+                                {default_prompt_instruction}
+                                """
+                            },
+                            *self.history,
+                            {"role": "user", "content": message},
+                            {
+                                "role": "assistant",
+                                "content": f"I'll use the {function_name} function to help answer your question."
+                            },
+                            {
+                                "role": "user",
+                                "content": f"""Function result: {execution_result}. Please provide a helpful response based on this result.
+                                
+                                {default_prompt_instruction}
+                                """
+                            }
+                        ],
+                        "stream": False
+                    }
+
+                    follow_http_start = time.perf_counter()
+                    follow_up_response = requests.post(
+                        f"{self.base_url}/api/chat",
+                        json=follow_up_payload,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    follow_http_duration_ms = (time.perf_counter() - follow_http_start) * 1000
+                    logging.debug(f"[timing] chat:followup_request duration_ms={follow_http_duration_ms:.2f}")
+
+                    if follow_up_response.status_code == 200:
+                        final_response = follow_up_response.json()
+                        total_duration_ms = (time.perf_counter() - total_start) * 1000
+                        logging.debug(f"[timing] chat_with_functions:end with_function duration_ms={total_duration_ms:.2f}")
+                        final_text = final_response.get("message", {}).get("content", "No response")
+                        self.history.append({"role": "user", "content": message})
+                        self.history.append({"role": "assistant", "content": final_text})
+                        if len(self.history) > 10:
+                            self.history = self.history[-10:]
+                        return final_text
+                    else:
+                        total_duration_ms = (time.perf_counter() - total_start) * 1000
+                        logging.debug(f"[timing] chat_with_functions:end followup_failed duration_ms={total_duration_ms:.2f}")
+                        return f"Function executed: {execution_result}"
+                except Exception as tc_e:
+                    logging.error(f"[tools] tool_calls handling failed: {tc_e}")
+
+            # Fallback: some models may return empty content via chat API. Try /api/generate once.
+            if not assistant_message or not assistant_message.strip():
+                try:
+                    fallback_prompt = (
+                        "You are a helpful assistant. Respond succinctly.\n\n" +
+                        f"User: {message}\nAssistant:"
+                    )
+                    fb_http_start = time.perf_counter()
+                    fb_resp = requests.post(
+                        f"{self.base_url}/api/generate",
+                        json={
+                            "model": self.model_name,
+                            "prompt": fallback_prompt,
+                            "stream": False,
+                        },
+                        headers={"Content-Type": "application/json"}
+                    )
+                    fb_http_ms = (time.perf_counter() - fb_http_start) * 1000
+                    logging.debug(f"[timing] chat:fallback_generate duration_ms={fb_http_ms:.2f}")
+                    if fb_resp.status_code == 200:
+                        fb_data = fb_resp.json()
+                        assistant_message = fb_data.get("response", "")
+                        logging.debug(f"[DEBUG] Fallback assistant message: {assistant_message}")
+                except Exception as fb_e:
+                    logging.error(f"[api] fallback generate failed: {fb_e}")
             
             # Check if the response contains a function call
             function_call_result = self._parse_function_call(assistant_message)
@@ -531,9 +665,13 @@ If you don't need to call a function, respond normally in plain text.
         try:
             # Try to parse as JSON
             response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
-            parsed = json.loads(response.strip())
+            trimmed = response.strip()
+            # Only attempt JSON parse if it looks like a JSON object
+            if not trimmed.startswith("{"):
+                return None
+            parsed = json.loads(trimmed)
             # print(f"[DEBUG] Parsed JSON: {parsed}")
-            if "function_call" in parsed:
+            if isinstance(parsed, dict) and "function_call" in parsed:
                 return parsed["function_call"]
         except json.JSONDecodeError:
             # Try to extract JSON from text response
@@ -542,7 +680,7 @@ If you don't need to call a function, respond normally in plain text.
             if json_match:
                 try:
                     parsed = json.loads(json_match.group())
-                    if "function_call" in parsed:
+                    if isinstance(parsed, dict) and "function_call" in parsed:
                         return parsed["function_call"]
                 except json.JSONDecodeError:
                     pass
@@ -561,10 +699,17 @@ class ComicsRead(Base):
 
 
 def get_engine():
-    """Create a SQLAlchemy engine from DATABASE_URL env var.
-    Example: postgresql+psycopg://user:password@localhost:5432/mydb
+    """Create a SQLAlchemy engine from environment variables.
+    Skips DB initialization if required variables are missing.
+    Env vars: POSTGRES_USER_NAME, POSTGRES_PASSWORD_VALUE, POSTGRES_DB_NAME
     """
-    database_url = f"postgresql+psycopg://{os.getenv('POSTGRES_USER_NAME')}:{os.getenv('POSTGRES_PASSWORD_VALUE')}@localhost:5432/{os.getenv('POSTGRES_DB_NAME')}"
+    user = os.getenv('POSTGRES_USER_NAME')
+    password = os.getenv('POSTGRES_PASSWORD_VALUE')
+    db_name = os.getenv('POSTGRES_DB_NAME')
+    if not user or not password or not db_name:
+        logging.error("[db] Skipping engine init: missing env vars")
+        return None
+    database_url = f"postgresql+psycopg://{user}:{password}@localhost:5432/{db_name}"
     return create_engine(database_url, pool_pre_ping=True)
 
 
@@ -746,6 +891,7 @@ def init_db():
     """Initialize the database schema (create tables if they don't exist)."""
     engine = get_engine()
     if engine is None:
+        logging.error("[db] No engine available; DB features disabled")
         return False
     global SessionLocal
     SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
