@@ -39,7 +39,8 @@ default_prompt_instruction = """Respond in plain text, not JSON.
 If a function call response then only respond by formulating the output of the function call.
 The response should be brief and to the point, it should be a single line.
 Do not give suggestions unless specifically asked.
-If the URL's are present in the function result, include them in the response."""
+If the URL's are present in the function result, include them in the response.
+If user asks to insert, update or delete the database, then insert, update or delete the entry in the database, no need to check if there is an existing entry."""
 
 
 @dataclass
